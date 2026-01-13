@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodejs-app-service
+  labels:
+    app: nodejs-app
+spec:
+  type: NodePort  # Exposes the service on each Node's IP at a static port
+  selector:
+    app: nodejs-app
+  ports:
+  - port: 3000        # Port on the service (ClusterIP)
+    targetPort: 3000  # Port on the container
+    nodePort: 30080   # Port on the Node (30000-32767 range)
+    protocol: TCP
+    name: http
+  sessionAffinity: ClientIP  # Sticky sessions based on client IP
