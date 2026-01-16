@@ -1,0 +1,818 @@
+# Adding MySQL Database to Your Kubernetes App
+
+## What Data We’ll Store
+
+Your app will store **request logs** in MySQL:
+
+- Timestamp of each request
+- Hostname (which pod served the request)
+- Client IP address
+- Request path
+- Response status
+
+This demonstrates:
+
+- Pod-to-pod communication (app → database)
+- Persistent storage in Kubernetes
+- Multi-container applications
+
+-----
+
+## Architecture After Adding MySQL
+
+```
+┌─────────────────────────────────────────────────┐
+│         KUBERNETES CLUSTER                      │
+│                                                 │
+│  ┌──────────────────────────────────────────┐  │
+│  │  NodeJS App Pods (3 replicas)            │  │
+│  │  ┌─────┐  ┌─────┐  ┌─────┐              │  │
+│  │  │Pod 1│  │Pod 2│  │Pod 3│              │  │
+│  │  └──┬──┘  └──┬──┘  └──┬──┘              │  │
+│  │     │        │        │                  │  │
+│  │     └────────┼────────┘                  │  │
+│  │              │                           │  │
+│  │              ▼                           │  │
+│  │     mysql-service (ClusterIP)           │  │
+│  │     Internal DNS: mysql:3306             │  │
+│  │              │                           │  │
+│  │              ▼                           │  │
+│  │  ┌──────────────────────┐               │  │
+│  │  │   MySQL Pod          │               │  │
+│  │  │   Port: 3306         │               │  │
+│  │  │   PersistentVolume   │               │  │
+│  │  └──────────────────────┘               │  │
+│  └──────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────┘
+```
+
+-----
+
+## Step 1: Install MySQL Package in Node.js
+
+Update `app/package.json`:
+
+```json
+{
+  "name": "nodejs-k8s-app",
+  "version": "1.0.0",
+  "description": "Node.js app with Docker and Kubernetes deployment",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": ["nodejs", "docker", "kubernetes"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.18.2",
+    "mysql2": "^3.6.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
+```
+
+-----
+
+## Step 2: Update server.js to Use MySQL
+
+```javascript
+const express = require('express');
+const path = require('path');
+const os = require('os');
+const mysql = require('mysql2/promise');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// MySQL connection configuration
+const dbConfig = {
+  host: process.env.MYSQL_HOST || 'mysql',
+  user: process.env.MYSQL_USER || 'appuser',
+  password: process.env.MYSQL_PASSWORD || 'apppassword',
+  database: process.env.MYSQL_DATABASE || 'appdb'
+};
+
+let db = null;
+
+// Initialize database connection
+async function initDatabase() {
+  try {
+    // Create connection pool
+    db = mysql.createPool({
+      ...dbConfig,
+      waitForConnections: true,
+      connectionLimit: 10,
+      queueLimit: 0
+    });
+
+    // Test connection
+    await db.query('SELECT 1');
+    console.log('✅ Connected to MySQL database');
+
+    // Create table if not exists
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS request_logs (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        hostname VARCHAR(255),
+        client_ip VARCHAR(45),
+        request_path VARCHAR(255),
+        status_code INT,
+        platform VARCHAR(50),
+        environment VARCHAR(50)
+      )
+    `);
+    console.log('✅ Request logs table ready');
+
+  } catch (error) {
+    console.error('❌ Database connection failed:', error.message);
+    // App continues to work without DB (graceful degradation)
+  }
+}
+
+// Initialize DB on startup
+initDatabase();
+
+// Middleware to serve static files
+app.use(express.static('public'));
+app.use(express.json());
+
+// Middleware to log requests to database
+app.use(async (req, res, next) => {
+  // Store original send function
+  const originalSend = res.send;
+  
+  // Override send to capture status code
+  res.send = function(data) {
+    // Log to database after response
+    if (db) {
+      db.query(
+        `INSERT INTO request_logs (hostname, client_ip, request_path, status_code, platform, environment) 
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          os.hostname(),
+          req.ip || req.connection.remoteAddress,
+          req.path,
+          res.statusCode,
+          os.platform(),
+          process.env.NODE_ENV || 'development'
+        ]
+      ).catch(err => console.error('Log insert error:', err.message));
+    }
+    
+    // Call original send
+    originalSend.call(this, data);
+  };
+  
+  next();
+});
+
+// API endpoint to get server info
+app.get('/api/info', (req, res) => {
+  res.json({
+    hostname: os.hostname(),
+    platform: os.platform(),
+    uptime: process.uptime(),
+    memory: {
+      total: `${(os.totalmem() / 1024 / 1024 / 1024).toFixed(2)} GB`,
+      free: `${(os.freemem() / 1024 / 1024 / 1024).toFixed(2)} GB`
+    },
+    environment: process.env.NODE_ENV || 'development',
+    timestamp: new Date().toISOString(),
+    database: db ? 'connected' : 'disconnected'
+  });
+});
+
+// NEW: Get request logs from database
+app.get('/api/logs', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ error: 'Database not connected' });
+    }
+
+    const limit = parseInt(req.query.limit) || 50;
+    const [rows] = await db.query(
+      'SELECT * FROM request_logs ORDER BY timestamp DESC LIMIT ?',
+      [limit]
+    );
+
+    res.json({
+      count: rows.length,
+      logs: rows
+    });
+  } catch (error) {
+    console.error('Error fetching logs:', error);
+    res.status(500).json({ error: 'Failed to fetch logs' });
+  }
+});
+
+// NEW: Get statistics
+app.get('/api/stats', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ error: 'Database not connected' });
+    }
+
+    // Total requests
+    const [totalRows] = await db.query('SELECT COUNT(*) as total FROM request_logs');
+    
+    // Requests by hostname (pod)
+    const [byPod] = await db.query(`
+      SELECT hostname, COUNT(*) as count 
+      FROM request_logs 
+      GROUP BY hostname 
+      ORDER BY count DESC
+    `);
+    
+    // Requests by path
+    const [byPath] = await db.query(`
+      SELECT request_path, COUNT(*) as count 
+      FROM request_logs 
+      GROUP BY request_path 
+      ORDER BY count DESC 
+      LIMIT 10
+    `);
+
+    res.json({
+      total_requests: totalRows[0].total,
+      requests_by_pod: byPod,
+      top_paths: byPath
+    });
+  } catch (error) {
+    console.error('Error fetching stats:', error);
+    res.status(500).json({ error: 'Failed to fetch statistics' });
+  }
+});
+
+// Health check endpoint
+app.get('/health', async (req, res) => {
+  const health = {
+    status: 'healthy',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  };
+
+  // Check database health
+  if (db) {
+    try {
+      await db.query('SELECT 1');
+      health.database = 'connected';
+    } catch (error) {
+      health.database = 'error';
+      health.status = 'degraded';
+    }
+  } else {
+    health.database = 'not_configured';
+  }
+
+  res.status(200).json(health);
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Something went wrong!' });
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`Hostname: ${os.hostname()}`);
+  console.log(`Database: ${dbConfig.host}`);
+});
+```
+
+-----
+
+## Step 3: Create MySQL Kubernetes Files
+
+### Create `k8s/mysql-secret.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+type: Opaque
+data:
+  # Base64 encoded values
+  # echo -n 'rootpassword123' | base64
+  mysql-root-password: cm9vdHBhc3N3b3JkMTIz
+  # echo -n 'apppassword' | base64
+  mysql-password: YXBwcGFzc3dvcmQ=
+```
+
+### Create `k8s/mysql-pvc.yaml`:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+```
+
+### Create `k8s/mysql-deployment.yaml`:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  labels:
+    app: mysql
+spec:
+  replicas: 1  # MySQL should only have 1 replica
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        ports:
+        - containerPort: 3306
+          name: mysql
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-root-password
+        - name: MYSQL_DATABASE
+          value: "appdb"
+        - name: MYSQL_USER
+          value: "appuser"
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-password
+        volumeMounts:
+        - name: mysql-storage
+          mountPath: /var/lib/mysql
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          exec:
+            command:
+            - mysqladmin
+            - ping
+            - -h
+            - localhost
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - mysql
+            - -h
+            - localhost
+            - -u
+            - root
+            - -prootpassword123
+            - -e
+            - SELECT 1
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: mysql-storage
+        persistentVolumeClaim:
+          claimName: mysql-pvc
+```
+
+### Create `k8s/mysql-service.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  labels:
+    app: mysql
+spec:
+  type: ClusterIP  # Internal only, not exposed externally
+  selector:
+    app: mysql
+  ports:
+  - port: 3306
+    targetPort: 3306
+    protocol: TCP
+    name: mysql
+```
+
+-----
+
+## Step 4: Update App Deployment
+
+Update `k8s/deployment.yaml` to add MySQL environment variables:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nodejs-app-deployment
+  labels:
+    app: nodejs-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nodejs-app
+  template:
+    metadata:
+      labels:
+        app: nodejs-app
+    spec:
+      containers:
+      - name: nodejs-app
+        image: nodejs-k8s-app:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 3000
+          name: http
+          protocol: TCP
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "3000"
+        - name: MYSQL_HOST
+          value: "mysql"  # Service name for DNS
+        - name: MYSQL_USER
+          value: "appuser"
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-password
+        - name: MYSQL_DATABASE
+          value: "appdb"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+```
+
+-----
+
+## Step 5: Update index.html to Show Database Data
+
+Add this to your `app/public/index.html` (add before the closing `</body>` tag):
+
+```html
+<!-- Add this section after the existing info card -->
+<div id="stats" class="info-card" style="margin-top: 20px;">
+    <h2 style="color: #667eea; margin-bottom: 15px;">📊 Database Statistics</h2>
+    <div class="loading">Loading database stats...</div>
+</div>
+
+<div id="logs" class="info-card" style="margin-top: 20px;">
+    <h2 style="color: #667eea; margin-bottom: 15px;">📝 Recent Request Logs</h2>
+    <div class="loading">Loading logs...</div>
+</div>
+
+<script>
+// Add these functions to your existing script section
+
+async function fetchStats() {
+    try {
+        const response = await fetch('/api/stats');
+        const data = await response.json();
+        displayStats(data);
+    } catch (error) {
+        document.getElementById('stats').innerHTML = `
+            <h2 style="color: #667eea; margin-bottom: 15px;">📊 Database Statistics</h2>
+            <div class="loading" style="color: #dc3545;">
+                Database not available
+            </div>
+        `;
+    }
+}
+
+function displayStats(data) {
+    const statsDiv = document.getElementById('stats');
+    
+    let podStats = '';
+    if (data.requests_by_pod) {
+        podStats = data.requests_by_pod.map(pod => `
+            <div class="info-item">
+                <span class="label">${pod.hostname}</span>
+                <span class="value">${pod.count} requests</span>
+            </div>
+        `).join('');
+    }
+    
+    statsDiv.innerHTML = `
+        <h2 style="color: #667eea; margin-bottom: 15px;">📊 Database Statistics</h2>
+        <div class="info-item">
+            <span class="label">Total Requests Logged:</span>
+            <span class="value">${data.total_requests || 0}</span>
+        </div>
+        ${podStats}
+    `;
+}
+
+async function fetchLogs() {
+    try {
+        const response = await fetch('/api/logs?limit=10');
+        const data = await response.json();
+        displayLogs(data.logs);
+    } catch (error) {
+        document.getElementById('logs').innerHTML = `
+            <h2 style="color: #667eea; margin-bottom: 15px;">📝 Recent Request Logs</h2>
+            <div class="loading" style="color: #dc3545;">
+                Database not available
+            </div>
+        `;
+    }
+}
+
+function displayLogs(logs) {
+    const logsDiv = document.getElementById('logs');
+    
+    if (!logs || logs.length === 0) {
+        logsDiv.innerHTML = `
+            <h2 style="color: #667eea; margin-bottom: 15px;">📝 Recent Request Logs</h2>
+            <div class="loading">No logs yet</div>
+        `;
+        return;
+    }
+    
+    const logItems = logs.map(log => `
+        <div class="info-item">
+            <span class="label">${new Date(log.timestamp).toLocaleString()}</span>
+            <span class="value">${log.hostname.substring(0, 20)}... → ${log.request_path}</span>
+        </div>
+    `).join('');
+    
+    logsDiv.innerHTML = `
+        <h2 style="color: #667eea; margin-bottom: 15px;">📝 Recent Request Logs</h2>
+        ${logItems}
+    `;
+}
+
+// Update the refresh function
+function refreshInfo() {
+    fetchServerInfo();
+    fetchStats();
+    fetchLogs();
+}
+
+// Load all data on page load
+fetchServerInfo();
+fetchStats();
+fetchLogs();
+
+// Auto-refresh every 5 seconds
+setInterval(refreshInfo, 5000);
+</script>
+```
+
+-----
+
+## Step 6: Deploy Everything
+
+```bash
+# Navigate to app folder and rebuild with MySQL support
+cd app
+npm install
+
+# Navigate back to root and rebuild Docker image
+cd ..
+
+# Point to Minikube Docker
+& minikube docker-env --shell powershell | Invoke-Expression
+
+# Rebuild the app image
+docker build -t nodejs-k8s-app:latest .
+
+# Deploy MySQL first
+kubectl apply -f k8s/mysql-secret.yaml
+kubectl apply -f k8s/mysql-pvc.yaml
+kubectl apply -f k8s/mysql-deployment.yaml
+kubectl apply -f k8s/mysql-service.yaml
+
+# Wait for MySQL to be ready
+kubectl wait --for=condition=ready pod -l app=mysql --timeout=120s
+
+# Deploy/update the Node.js app
+kubectl apply -f k8s/deployment.yaml
+
+# Check everything is running
+kubectl get pods
+kubectl get pvc
+kubectl get svc
+```
+
+-----
+
+## Step 7: Verify It Works
+
+```bash
+# Get the service URL
+minikube service nodejs-app-service --url
+
+# Open in browser - you should see:
+# 1. Server info (as before)
+# 2. Database Statistics showing request counts
+# 3. Recent Request Logs from MySQL
+```
+
+### Test the database:
+
+```bash
+# Check app logs to see DB connection
+kubectl logs -l app=nodejs-app
+
+# Should see: "✅ Connected to MySQL database"
+
+# Access MySQL directly
+kubectl exec -it $(kubectl get pod -l app=mysql -o jsonpath='{.items[0].metadata.name}') -- mysql -u appuser -papppassword appdb
+
+# Inside MySQL:
+mysql> SELECT * FROM request_logs;
+mysql> SELECT hostname, COUNT(*) FROM request_logs GROUP BY hostname;
+mysql> exit
+```
+
+-----
+
+## What Data is Being Stored
+
+### Request Logs Table Schema:
+
+|Column      |Type        |Description                         |
+|------------|------------|------------------------------------|
+|id          |INT         |Auto-increment primary key          |
+|timestamp   |DATETIME    |When the request was made           |
+|hostname    |VARCHAR(255)|Which pod served the request        |
+|client_ip   |VARCHAR(45) |Client’s IP address                 |
+|request_path|VARCHAR(255)|URL path requested (/api/info, etc.)|
+|status_code |INT         |HTTP response code (200, 404, etc.) |
+|platform    |VARCHAR(50) |OS platform (linux)                 |
+|environment |VARCHAR(50) |Development/production              |
+
+### Example Data:
+
+```
++----+---------------------+--------------------------------+-------------+--------------+-------------+----------+-------------+
+| id | timestamp           | hostname                       | client_ip   | request_path | status_code | platform | environment |
++----+---------------------+--------------------------------+-------------+--------------+-------------+----------+-------------+
+|  1 | 2026-01-15 10:30:15 | nodejs-app-deployment-abc123   | 172.17.0.1 | /api/info    | 200         | linux    | production  |
+|  2 | 2026-01-15 10:30:17 | nodejs-app-deployment-def456   | 172.17.0.1 | /            | 200         | linux    | production  |
+|  3 | 2026-01-15 10:30:20 | nodejs-app-deployment-ghi789   | 172.17.0.1 | /api/stats   | 200         | linux    | production  |
++----+---------------------+--------------------------------+-------------+--------------+-------------+----------+-------------+
+```
+
+-----
+
+## Architecture Explanation
+
+### How Pods Communicate with MySQL:
+
+```
+Node.js Pod 1 (10.244.0.2)
+      ↓
+   DNS Lookup: "mysql" → 10.96.x.y (Service ClusterIP)
+      ↓
+   MySQL Service (10.96.x.y:3306)
+      ↓
+   MySQL Pod (10.244.0.5:3306)
+      ↓
+   PersistentVolume (/var/lib/mysql)
+```
+
+**Key Points:**
+
+1. **DNS Resolution**: Node.js connects to `mysql:3306` (service name)
+1. **ClusterIP Service**: Internal-only, not exposed outside cluster
+1. **Single Replica**: MySQL runs 1 pod (databases need special handling for multi-replica)
+1. **Persistent Storage**: Data survives pod restarts via PersistentVolumeClaim
+
+-----
+
+## Why This Demonstrates Important Concepts
+
+### 1. **Service Discovery**
+
+- App uses hostname `mysql` (not IP)
+- Kubernetes DNS resolves `mysql` → MySQL Service IP
+- Even if MySQL pod restarts with new IP, service name stays same
+
+### 2. **Secrets Management**
+
+- Passwords stored in Kubernetes Secrets (not hardcoded)
+- Base64 encoded (not encrypted - use Vault in production)
+- Injected as environment variables
+
+### 3. **Persistent Storage**
+
+- PersistentVolumeClaim requests storage
+- Data survives pod deletion/restart
+- Minikube provides storage automatically
+
+### 4. **Microservices Architecture**
+
+- Frontend (browser) → App Service → App Pods
+- App Pods → MySQL Service → MySQL Pod
+- Each component scalable independently
+
+-----
+
+## Troubleshooting Commands
+
+```bash
+# Check if MySQL pod is running
+kubectl get pods -l app=mysql
+
+# Check MySQL logs
+kubectl logs -l app=mysql
+
+# Check app logs for DB connection
+kubectl logs -l app=nodejs-app | grep -i database
+
+# Verify MySQL service exists
+kubectl get svc mysql
+
+# Check persistent volume
+kubectl get pvc
+
+# Test DB connection from app pod
+kubectl exec -it <app-pod-name> -- wget -qO- http://mysql:3306
+# Should get MySQL error (proves connectivity)
+
+# Access MySQL directly
+kubectl exec -it <mysql-pod-name> -- mysql -u appuser -papppassword appdb
+```
+
+-----
+
+## Summary
+
+**What you added:**
+
+- ✅ MySQL database (1 pod)
+- ✅ Persistent storage (data survives restarts)
+- ✅ Secrets for passwords
+- ✅ ClusterIP service (internal networking)
+- ✅ Request logging to database
+- ✅ Statistics API
+- ✅ Pod-to-pod communication
+
+**What data is stored:**
+
+- Every HTTP request is logged
+- Shows which pod served each request
+- Proves load balancing is working
+- Data persists even if pods restart
+
+**Real-world use:**
+This pattern (App + Database) is the foundation of most web applications. You’ve learned how to deploy a multi-tier application on Kubernetes!
